@@ -1,0 +1,173 @@
+name: Watchtower Letta 4731 compatibility
+
+on:
+  push:
+    branches:
+      - watchtower/letta-4731-compat-20260926-0919
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watchtower-letta-4731-compat
+  cancel-in-progress: false
+
+jobs:
+  compatibility:
+    name: Verify ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        variant: [upstream-main, pr-head, upstream-main-with-pr]
+    env:
+      CI: 'true'
+      HUSKY: '0'
+      DO_NOT_TRACK: '1'
+      SCARF_ANALYTICS: 'false'
+      UPSTREAM_SHA: 5e420db9f2871bc3106ba14372d4f8d94c5e63ae
+      PR_SHA: 9b97fefca9fa365fed346a02dbdc0cfde8fe4992
+      VARIANT: ${{ matrix.variant }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    steps:
+      - name: Checkout exact public upstream revision
+        uses: actions/checkout@v6
+        with:
+          repository: letta-ai/letta-code
+          ref: 5e420db9f2871bc3106ba14372d4f8d94c5e63ae
+          fetch-depth: 0
+          persist-credentials: false
+          path: source
+
+      - name: Prepare isolated source variant
+        id: prepare
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$UPSTREAM_SHA"
+          git fetch --no-tags origin "$PR_SHA"
+          test "$(git rev-parse FETCH_HEAD)" = "$PR_SHA"
+          git config user.name 'Watchtower compatibility test'
+          git config user.email 'watchtower@example.invalid'
+          mkdir -p "$RUNNER_TEMP/watchtower-evidence"
+          case "$VARIANT" in
+            upstream-main) ;;
+            pr-head) git checkout --detach "$PR_SHA" ;;
+            upstream-main-with-pr)
+              git -c core.hooksPath=/dev/null merge --no-commit --no-ff "$PR_SHA"
+              git diff --cached --check
+              git diff --cached --name-only > "$RUNNER_TEMP/watchtower-evidence/merged-files.txt"
+              ;;
+            *) exit 2 ;;
+          esac
+          printf 'variant=%s\nupstream_sha=%s\npr_sha=%s\ncheckout_head=%s\nindex_tree=%s\n' \
+            "$VARIANT" "$UPSTREAM_SHA" "$PR_SHA" "$(git rev-parse HEAD)" "$(git write-tree)" \
+            | tee "$RUNNER_TEMP/watchtower-evidence/revisions.txt"
+          git status --short | tee "$RUNNER_TEMP/watchtower-evidence/source-status.txt"
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+
+      - name: Install locked dependencies without service credentials
+        id: install
+        run: |
+          set -euo pipefail
+          unset LETTA_API_KEY ANYSEARCH_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GITHUB_TOKEN GH_TOKEN NODE_AUTH_TOKEN NPM_TOKEN
+          bun install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/watchtower-evidence/install.log"
+
+      - name: Build
+        id: build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          bun run build 2>&1 | tee "$RUNNER_TEMP/watchtower-evidence/build.log"
+
+      - name: Type check
+        id: typecheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          bun run typecheck 2>&1 | tee "$RUNNER_TEMP/watchtower-evidence/typecheck.log"
+
+      - name: Run focused tests in separate processes
+        id: tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          failures=0
+          files=(
+            src/mcp-presets.test.ts
+            src/cli/commands/mcp.test.ts
+            src/cli/subcommands/mcp-anysearch-oauth.test.ts
+            src/mcp-client.test.ts
+            src/mcp-runtime-oauth.test.ts
+            src/mcp-settings.test.ts
+            src/agent/skills-discovery.test.ts
+          )
+          for file in "${files[@]}"; do
+            log_name="${file//\//_}"
+            if [[ ! -f "$file" ]]; then
+              if [[ "$VARIANT" == upstream-main ]]; then
+                printf 'BASELINE_FILE_NOT_PRESENT %s\n' "$file" | tee -a "$RUNNER_TEMP/watchtower-evidence/tests-summary.txt"
+                continue
+              fi
+              printf 'FAIL_MISSING_FILE %s\n' "$file" | tee -a "$RUNNER_TEMP/watchtower-evidence/tests-summary.txt"
+              failures=$((failures + 1))
+              continue
+            fi
+            bun test "./$file" --timeout 30000 2>&1 | tee "$RUNNER_TEMP/watchtower-evidence/$log_name.log"
+            code=${PIPESTATUS[0]}
+            printf 'TEST_EXIT %s %s\n' "$code" "$file" | tee -a "$RUNNER_TEMP/watchtower-evidence/tests-summary.txt"
+            if [[ "$code" -ne 0 ]]; then failures=$((failures + 1)); fi
+          done
+          [[ "$failures" -eq 0 ]]
+
+      - name: Record results
+        if: ${{ always() }}
+        working-directory: .
+        env:
+          PREPARE: ${{ steps.prepare.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          TYPECHECK: ${{ steps.typecheck.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/watchtower-evidence"
+          printf 'variant=%s\nprepare=%s\ninstall=%s\nbuild=%s\ntypecheck=%s\ntests=%s\n' \
+            "$VARIANT" "$PREPARE" "$INSTALL" "$BUILD" "$TYPECHECK" "$TESTS" \
+            | tee "$RUNNER_TEMP/watchtower-evidence/outcomes.txt" >> "$GITHUB_STEP_SUMMARY"
+          printf '\nThis is an isolated compatibility check, not upstream approval, live E2E, merge evidence, or bounty/payment acceptance.\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Preserve bounded test evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: letta-4731-${{ matrix.variant }}
+          path: ${{ runner.temp }}/watchtower-evidence/
+          retention-days: 7
+
+      - name: Enforce result
+        if: ${{ always() }}
+        working-directory: .
+        env:
+          PREPARE: ${{ steps.prepare.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+          TYPECHECK: ${{ steps.typecheck.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+        run: |
+          test "$PREPARE" = success && test "$INSTALL" = success && test "$BUILD" = success && test "$TYPECHECK" = success && test "$TESTS" = success
