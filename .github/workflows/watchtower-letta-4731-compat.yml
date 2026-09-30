@@ -27,7 +27,7 @@ jobs:
       HUSKY: '0'
       DO_NOT_TRACK: '1'
       SCARF_ANALYTICS: 'false'
-      UPSTREAM_SHA: 0bb6f741a2cd80159837255a8b23964beeb27e03
+      UPSTREAM_SHA: 1a1765b0bbbbeb6110621139f717f50897e7e883
       PR_SHA: 9b97fefca9fa365fed346a02dbdc0cfde8fe4992
       VARIANT: ${{ matrix.variant }}
     defaults:
@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: letta-ai/letta-code
-          ref: 0bb6f741a2cd80159837255a8b23964beeb27e03
+          ref: 1a1765b0bbbbeb6110621139f717f50897e7e883
           fetch-depth: 0
           persist-credentials: false
           path: source
